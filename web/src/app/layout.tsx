@@ -26,7 +26,18 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
       <body className="min-h-full flex flex-col font-sans">
         <header className="mx-auto flex w-full max-w-6xl items-center justify-between px-5 py-4">
           <Link href="/" className="flex items-center gap-2 font-display text-xl font-extrabold tracking-tight">
-            <span aria-hidden className="checker inline-block size-6 rounded-md ring-2 ring-ink" />
+            <svg aria-hidden viewBox="0 0 64 64" className="size-7">
+              <defs>
+                <pattern id="logo-k" width="18" height="18" patternUnits="userSpaceOnUse" x="5" y="5">
+                  <rect width="18" height="18" fill="var(--check-a)" />
+                  <rect width="9" height="9" fill="var(--check-b)" />
+                  <rect x="9" y="9" width="9" height="9" fill="var(--check-b)" />
+                </pattern>
+              </defs>
+              <rect x="5" y="5" width="54" height="54" rx="13" fill="url(#logo-k)" />
+              <circle cx="32" cy="32" r="13" fill="var(--accent)" />
+              <rect x="5" y="5" width="54" height="54" rx="13" fill="none" stroke="var(--ink)" strokeWidth="6" />
+            </svg>
             nobg
           </Link>
           <nav className="flex items-center gap-5 text-sm text-muted">
