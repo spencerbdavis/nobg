@@ -1,8 +1,8 @@
-# nobg on ubuntu2 (~/nobg), deployed by deploy.sh.
+# nobg inference stack (~/nobg on the server), deployed by deploy.sh.
 # Contained: the API (which parses untrusted uploads) sits only on internal networks, so it has no route to
-# the internet, the LAN (Home Assistant etc.) or the host. Only the tunnel container has egress, and it can
+# the internet, the LAN or the host. Only the tunnel container has egress, and it can
 # reach nothing but the API. Read-only root filesystems, all capabilities dropped, non-root users, memory,
-# CPU and PID caps. No published ports; no other ubuntu2 service is touched.
+# CPU and PID caps. No published ports; nothing else on the host is touched.
 #   docker compose up -d                     # API + Redis + Postgres (private)
 #   docker compose --profile public up -d    # + Cloudflare tunnel for api.nobg.here
 #   docker compose --profile local up -d     # + 127.0.0.1:8514 proxy for local testing (ssh -L 8514:localhost:8514)

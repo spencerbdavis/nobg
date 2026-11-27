@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Sync the server side to ubuntu2 and (re)start it. Usage: ./deploy.sh [--public]
+# Sync the server side to your box and (re)start it. Usage: ./deploy.sh [--public]
+# Target comes from NOBG_HOST (e.g. user@homeserver), or from a gitignored .env.deploy file.
 set -euo pipefail
-HOST="${NOBG_HOST:-spencer@ubuntu2}"; DIR="${NOBG_DIR:-nobg}"
 cd "$(dirname "$0")"
+[ -f .env.deploy ] && . ./.env.deploy
+HOST="${NOBG_HOST:?set NOBG_HOST=user@host (or put it in .env.deploy)}"; DIR="${NOBG_DIR:-nobg}"
 rsync -az --delete --exclude __pycache__ server db tools docker-compose.yml fetch-models.sh smoke.sh .env.example .dockerignore "$HOST:$DIR/"
 ssh "$HOST" bash -s -- "$DIR" "${1:-none}" <<'REMOTE'
 set -euo pipefail

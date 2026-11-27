@@ -12,7 +12,10 @@ export const metadata: Metadata = {
   title: "nobg — remove image backgrounds free, instantly, privately",
   description:
     "Free background remover. Drop a photo and get a clean transparent PNG in seconds, processed on your own device. No sign-up, no watermark, full resolution.",
-  openGraph: { title: "nobg — free background remover", description: "Clean cutouts in seconds, right in your browser.", url: "https://nobg.here" },
+  keywords: ["remove background", "background remover", "transparent PNG", "remove bg", "free", "WebGPU", "cutout"],
+  alternates: { canonical: "/" },
+  openGraph: { title: "nobg — free background remover", description: "Clean cutouts in seconds, right in your browser. No sign-up, no watermark.", url: "https://nobg.here", siteName: "nobg", type: "website" },
+  twitter: { card: "summary_large_image", title: "nobg — free background remover", description: "Clean cutouts in seconds, right in your browser." },
 };
 
 export const viewport: Viewport = { themeColor: [{ media: "(prefers-color-scheme: dark)", color: "#151412" }, { color: "#fbf8f3" }] };
@@ -28,6 +31,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
           </Link>
           <nav className="flex items-center gap-5 text-sm text-muted">
             <Link href="/developers" className="hover:text-ink">API</Link>
+            <a href="https://github.com/spencerbdavis/nobg" className="hover:text-ink">GitHub</a>
           </nav>
         </header>
         <main className="flex-1">{children}</main>

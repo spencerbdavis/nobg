@@ -1,82 +1,99 @@
-# nobg
+# nobg: free background remover that runs in your browser
 
-Free background remover at **[nobg.here](https://nobg.here)**: TinyPNG-style zero friction, with remove.bg-style polish.
+**[nobg.here](https://nobg.here)** removes image backgrounds in under a second, right on your device. No sign-up, no
+watermark, no upload (with WebGPU), and full resolution.
 
-- **Web (Vercel, `web/`)**: Next.js and Tailwind. Drop, paste or pick a sample, watch the cutout reveal, compare it with a
-  before/after slider, swap the background (transparent, colours, custom, blur) and download a full-resolution PNG.
-- **On-device first**: with WebGPU, cutouts run in the browser (ISNet fp16, about 0.5 s for 1.6 MP and 1.3 s for 12 MP on an
-  M-series Mac). The model downloads once (90 MB) and is cached. Server cost: $0.
-- **Server fallback and API (ubuntu2, `server/`)**: FastAPI with ONNX Runtime on CPU (about 3–5 s per image), Redis and Postgres,
-  exposed only through a Cloudflare Tunnel at `api.nobg.here`. Uploads go straight from the browser to the API, never
-  through Vercel (4.5 MB body cap).
+[![nobg: drop a photo and get a clean transparent cutout](docs/screenshot.jpg)](https://nobg.here)
+
+- **Zero friction.** The landing page is the tool. Drop a file anywhere, paste with ⌘V, or try a sample.
+- **Private by default.** With WebGPU (Chrome, Edge, Safari 26+), the AI model runs in your browser and your photo never
+  leaves your machine. Older devices fall back to a server that processes in memory and keeps nothing.
+- **Fast.** About 0.5 s for a typical photo and 1.3 s for a 12 MP phone shot on an M-series Mac after a one-time 90 MB
+  model download.
+- **Clean edges.** A matting model plus colour decontamination, so hair and fur don't get a halo.
+- **Quick polish.** Before/after slider, and backgrounds that are transparent, solid, a custom colour, or a blur of the
+  original. Download a PNG or a composite.
+- **A small REST API** with a remove.bg-compatible `image_file` field, async jobs and per-key limits.
+  See [nobg.here/developers](https://nobg.here/developers).
+
+## How it works
 
 ```
-browser ──(WebGPU)──> cutout on device               model: api.nobg.here/models/*.bin (immutable, CF edge-cached)
-   └──(no WebGPU)──> api.nobg.here ─ CF Tunnel ─> nobg-tunnel ─(internal net)─> nobg-api ─(internal net)─> redis, postgres
+browser ──(WebGPU)──> cutout on device             model: /models/*.bin (immutable, edge-cached by Cloudflare)
+   └──(no WebGPU)──> api.nobg.here ─ Cloudflare Tunnel ─> nobg-tunnel ─(internal)─> nobg-api ─(internal)─> redis, postgres
 ```
 
-## Quality pipeline (identical on device and server)
+| Layer | What |
+|---|---|
+| Web (`web/`) | Next.js and Tailwind on Vercel. The model runs in a Web Worker via ONNX Runtime Web (WebGPU). |
+| Inference (`server/`) | FastAPI, ONNX Runtime (CPU), Redis rate limits and job queue, Postgres for keys and usage. Docker Compose on a small home server, reachable only through a Cloudflare Tunnel. |
+| Model | [ISNet / DIS](https://github.com/xuebinqin/DIS) general-use (Apache-2.0). The browser gets an fp16 build (`tools/make_web_model.py`, reproducible and checksum-verified). |
 
-1. ISNet-general (DIS, Apache-2.0) matte at 1024×1024.
+The cutout pipeline is identical on device and server, and their outputs differ by less than 1/255 in alpha on average:
+
+1. ISNet matte at 1024×1024.
 2. Bilinear upscale of the matte to the original resolution (up to 16 MP).
-3. Two-pass blur-fusion foreground estimation removes background colour spill from hair and soft edges.
-   The browser computes the smooth fields at ≤1024 px and combines them at full resolution, which keeps memory low.
+3. Two-pass blur-fusion foreground estimation, which strips background colour spill from soft edges. The browser
+   computes the smooth fields at ≤1024 px and combines them at full resolution, so memory stays low on phones.
 
-Device and server output differ by less than 1/255 in alpha on average.
+Uploads go straight from the browser to the API, never through Vercel, whose function bodies are capped at 4.5 MB.
 
-**Why not BiRefNet?** It was benchmarked on ubuntu2 at 16 s and 6.8 GB of RAM per image on CPU, which is too heavy next to
-Home Assistant. In the browser, ONNX Runtime Web's WebGPU kernels exceed Chrome's 10-storage-buffer limit on its wide
-Split/Concat nodes. Rewriting those nodes fixes that, but the model then runs out of WASM heap. Revisit when ORT-web
-improves or with a GPU host. `NEXT_PUBLIC_MODEL_URL` lets you swap the browser model without code changes.
+### Why not BiRefNet?
 
-## Containment on ubuntu2
+It's sharper on hair, but on a CPU-only home server it took 16 s and 6.8 GB of RAM per image. In the browser, ONNX Runtime
+Web's WebGPU kernels exceed Chrome's 10-storage-buffer limit on BiRefNet's wide Split/Concat nodes. Rewriting those nodes
+gets past that, but the model then runs out of WASM heap. `NEXT_PUBLIC_MODEL_URL` lets you swap the browser model without
+code changes once that improves.
 
-`docker-compose.yml` (project `nobg`, nothing shared with other stacks):
+## Self-hosting the inference server
 
-- `nobg-api` parses untrusted uploads, so it sits **only on internal networks**. It has no route to the internet, the LAN
-  (Home Assistant etc.) or the host (verified). It also has no published ports.
+The stack is locked down because it parses untrusted uploads:
+
+- `nobg-api` sits **only on internal Docker networks**. It has no route to the internet, your LAN or the host, and no
+  published ports.
 - `nobg-tunnel` (cloudflared) is the only container with egress, and it can reach only the API.
-- Redis has no persistence. Postgres lives in `./data/postgres`. Both are internal-only.
-- Every container: read-only root filesystem, `cap_drop: ALL`, `no-new-privileges`, non-root user, memory/CPU/PID caps
-  (API: 3 GB, 4 CPUs, at most 2 concurrent inferences, 6 queued, then 503).
-- Images are held in RAM only. Async jobs keep input and result in Redis with a 1 h TTL.
-
-## Operate
+- Every container has a read-only root filesystem, `cap_drop: ALL`, `no-new-privileges`, a non-root user and
+  memory/CPU/PID caps. The API is limited to 3 GB, 4 CPUs and 2 concurrent inferences, with up to 6 queued before it
+  returns 503.
+- Images live in RAM only. Async jobs keep input and result in Redis with a 1 h TTL.
 
 ```bash
-./deploy.sh                 # rsync to spencer@ubuntu2:~/nobg, fetch/build models, docker compose up
-./deploy.sh --public        # same, plus the Cloudflare tunnel (needs TUNNEL_TOKEN in ~/nobg/.env)
+echo 'NOBG_HOST=user@yourserver' > .env.deploy     # gitignored
+./deploy.sh                 # rsync to ~/nobg on the server, fetch/build models, docker compose up
+./deploy.sh --public        # same, plus the Cloudflare tunnel (TUNNEL_TOKEN in ~/nobg/.env)
 
-# on ubuntu2, in ~/nobg
+# on the server, in ~/nobg
 docker compose exec api python -m app.admin create-key you@example.com --plan personal --label laptop
 docker compose exec api python -m app.admin list
 docker compose exec api python -m app.admin revoke bg_live_AbCd
 ./smoke.sh photo.jpg out.png                       # test through the private network
-docker compose --profile local up -d               # optional 127.0.0.1:8514 door for local dev (ssh -L 8514:localhost:8514 ubuntu2)
+docker compose --profile local up -d               # optional 127.0.0.1:8514 door for local development
 ```
 
-`DATABASE_URL` in `.env` can point to Neon or Supabase to move state off the box. The schema (`db/schema.sql`) is applied on
-startup. Moving to a VPS or GPU host means copying `.env`, running `./deploy.sh --public`, and letting both tunnel replicas
-overlap.
+**Tunnel:** Cloudflare Zero Trust → Networks → Tunnels → create one, then add the public hostname `api.<your-domain>` →
+`http://nobg-api:8000`. Put the token in `~/nobg/.env` as `TUNNEL_TOKEN=`.
 
-### Cloudflare tunnel (one-time)
+**State:** set `DATABASE_URL` in `.env` to Neon or Supabase to move Postgres off the box. The schema (`db/schema.sql`) is
+applied on startup. To move to a VPS or GPU host, copy `.env` and run `./deploy.sh --public`. Two tunnel replicas can
+overlap for a zero-downtime cutover.
 
-Zero Trust → Networks → Tunnels → Create tunnel (cloudflared) named `nobg`. Add the public hostname
-`api.nobg.here` → service `http://nobg-api:8000`. Put the token in `~/nobg/.env` as `TUNNEL_TOKEN=` and run
-`./deploy.sh --public`.
-
-## Web
+## Web development
 
 ```bash
-cd web && pnpm install && pnpm dev     # NEXT_PUBLIC_API_URL=http://localhost:8514 in .env.local to use the local door
+cd web && pnpm install && pnpm dev
 ```
 
-Env: `NEXT_PUBLIC_API_URL` (default `https://api.nobg.here`), `NEXT_PUBLIC_MODEL_URL` (default `<api>/models/isnet-fp16-281bde9e.bin`).
-Add `?server` to the URL to force the server path.
+Env: `NEXT_PUBLIC_API_URL` (default `https://api.nobg.here`) and `NEXT_PUBLIC_MODEL_URL` (default
+`<api>/models/isnet-fp16-281bde9e.bin`). Add `?server` to the URL to force the server path.
 
 ## API
 
-See [nobg.here/developers](https://nobg.here/developers). `POST /v1/remove` (multipart `image_file` or raw body, as in
-remove.bg), `POST /v1/jobs` + `GET /v1/jobs/{id}[/result]`, `GET /v1/usage`. Keys are `bg_live_…`, stored as SHA-256.
-Limits use Redis sliding windows per key (free 10/min and 100/day, personal 30/1,000, pro 60/10,000) and per IP for
-the web fallback (8/min, 60/day).
+`POST /v1/remove` (multipart `image_file` or raw body), `POST /v1/jobs` and `GET /v1/jobs/{id}[/result]`, `GET /v1/usage`.
+Keys look like `bg_live_…` and are stored only as SHA-256 hashes. Limits are Redis sliding windows per key (free 10/min and
+100/day, personal 30 and 1,000, pro 60 and 10,000) and per IP for the web fallback (8/min, 60/day).
+Full docs: [nobg.here/developers](https://nobg.here/developers).
+
+## Credits
+
+Model: ISNet / DIS by Xuebin Qin et al. (Apache-2.0), via the [rembg](https://github.com/danielgatis/rembg) ONNX export.
+Sample photos: [Unsplash](https://unsplash.com).
