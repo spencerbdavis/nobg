@@ -1,0 +1,101 @@
+# nobg on ubuntu2 (~/nobg), deployed by deploy.sh.
+# Contained: the API (which parses untrusted uploads) sits only on internal networks, so it has no route to
+# the internet, the LAN (Home Assistant etc.) or the host. Only the tunnel container has egress, and it can
+# reach nothing but the API. Read-only root filesystems, all capabilities dropped, non-root users, memory,
+# CPU and PID caps. No published ports; no other ubuntu2 service is touched.
+#   docker compose up -d                     # API + Redis + Postgres (private)
+#   docker compose --profile public up -d    # + Cloudflare tunnel for api.nobg.here
+#   docker compose --profile local up -d     # + 127.0.0.1:8514 proxy for local testing (ssh -L 8514:localhost:8514)
+#   ./smoke.sh                               # test from a throwaway container on the edge network
+name: nobg
+
+x-hardening: &hardening
+  restart: unless-stopped
+  read_only: true
+  security_opt: [no-new-privileges:true]
+  cap_drop: [ALL]
+  logging:
+    driver: json-file
+    options: { max-size: 10m, max-file: "3" }
+
+services:
+  api:
+    <<: *hardening
+    build: { context: ., dockerfile: server/Dockerfile }
+    image: nobg-api:latest
+    container_name: nobg-api
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: ${DATABASE_URL:-postgresql://nobg:${POSTGRES_PASSWORD}@db:5432/nobg}
+    volumes: ["./models:/models:ro"]
+    tmpfs: ["/tmp:size=256m"]
+    networks: [edge, internal]
+    mem_limit: 3g
+    memswap_limit: 3g
+    cpus: 4.0
+    pids_limit: 128
+    depends_on:
+      redis: { condition: service_healthy }
+      db: { condition: service_healthy }
+
+  redis:
+    <<: *hardening
+    image: redis:8.2-alpine
+    container_name: nobg-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "200mb", "--maxmemory-policy", "volatile-lru"]
+    user: redis
+    tmpfs: ["/data:size=16m"]
+    networks: [internal]
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
+    healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 10s, timeout: 3s, retries: 5 }
+
+  db:
+    <<: *hardening
+    image: postgres:17-alpine
+    container_name: nobg-db
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER]   # entrypoint drops to the postgres user
+    environment:
+      POSTGRES_USER: nobg
+      POSTGRES_DB: nobg
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes: ["./data/postgres:/var/lib/postgresql/data"]
+    tmpfs: ["/var/run/postgresql", "/tmp"]
+    networks: [internal]
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
+    healthcheck: { test: ["CMD", "pg_isready", "-U", "nobg"], interval: 10s, timeout: 3s, retries: 5 }
+
+  tunnel:
+    <<: *hardening
+    image: cloudflare/cloudflared:2026.10.3
+    container_name: nobg-tunnel
+    profiles: [public]
+    command: ["tunnel", "--no-autoupdate", "run"]
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN}
+    networks: [edge, egress]
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 64
+    depends_on: [api]
+
+  port:   # optional localhost-only door to the API; the API itself still has no outbound route
+    <<: *hardening
+    image: alpine/socat:1.8.0.3
+    container_name: nobg-port
+    profiles: [local]
+    command: ["TCP-LISTEN:8000,fork,reuseaddr", "TCP:nobg-api:8000"]
+    user: "65534:65534"
+    ports: ["127.0.0.1:8514:8000"]
+    networks: [edge, egress]
+    mem_limit: 64m
+    pids_limit: 64
+
+networks:
+  edge: { internal: true }       # API <-> tunnel only
+  internal: { internal: true }   # API <-> Redis/Postgres
+  egress: {}                     # tunnel -> Cloudflare

@@ -1,0 +1,88 @@
+@import "tailwindcss";
+
+:root {
+  --paper: #fbf8f3;
+  --ink: #1c1a17;
+  --muted: #6f6a62;
+  --line: #e7e1d7;
+  --card: #ffffff;
+  --accent: #f2542d;
+  --accent-ink: #ffffff;
+  --accent-soft: #fde6df;
+  --check-a: #ffffff;
+  --check-b: #ecebe8;
+}
+
+@theme inline {
+  --color-paper: var(--paper);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --color-card: var(--card);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-soft: var(--accent-soft);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --font-display: var(--font-display);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --paper: #151412;
+    --ink: #f3efe8;
+    --muted: #a39d93;
+    --line: #2d2a26;
+    --card: #1d1b19;
+    --accent: #ff6a45;
+    --accent-soft: #3a211a;
+    --check-a: #2a2825;
+    --check-b: #222120;
+  }
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+}
+
+.checker {
+  background-color: var(--check-a);
+  background-image: conic-gradient(var(--check-b) 25%, transparent 0 50%, var(--check-b) 0 75%, transparent 0);
+  background-size: 18px 18px;
+}
+
+.shimmer {
+  background: linear-gradient(100deg, transparent 20%, rgb(255 255 255 / 0.45) 50%, transparent 80%);
+  background-size: 220% 100%;
+  animation: shimmer 1.4s linear infinite;
+}
+@keyframes shimmer {
+  from { background-position: 120% 0; }
+  to { background-position: -120% 0; }
+}
+
+.sweep::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.55) 45%, rgb(242 84 45 / 0.35) 50%, rgb(255 255 255 / 0.55) 55%, transparent);
+  background-size: 40% 100%;
+  background-repeat: no-repeat;
+  animation: sweep 1.1s ease-in-out infinite;
+  mix-blend-mode: soft-light;
+}
+@keyframes sweep {
+  from { background-position: -60% 0; }
+  to { background-position: 160% 0; }
+}
+
+@keyframes pop-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+.pop-in { animation: pop-in 0.35s cubic-bezier(0.2, 0.8, 0.2, 1) both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .shimmer, .sweep::after, .pop-in { animation: none; }
+}
