@@ -4,10 +4,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { hasWebGPU, isModelReady, onProgress, preload, removeBackground, type CutoutResult, type Where } from "@/lib/engine";
 
 type Bg = { kind: "none" } | { kind: "color"; color: string } | { kind: "blur" };
+type Dl = { loaded: number; total: number };
+type Dls = { quick?: Dl; full?: Dl };
 type State =
   | { s: "idle" }
-  | { s: "working"; src: string; name: string; file: Blob; where?: Where; dl?: { loaded: number; total: number } }
-  | { s: "done"; src: string; name: string; file: Blob; out: string; res: CutoutResult }
+  | { s: "working"; src: string; name: string; file: Blob; where?: Where; dl?: Dls }
+  | { s: "done"; src: string; name: string; file: Blob; out: string; res: CutoutResult; dl?: Dls }
   | { s: "error"; src?: string; name?: string; file?: Blob; message: string };
 
 const SAMPLES = [
@@ -96,9 +98,12 @@ export default function Tool() {
     hasWebGPU().then(setGpu);
     return onProgress((p) => {
       setState((st) => {
-        if (st.s !== "working") return st;
-        if (p.phase === "download") return p.loaded >= p.total ? { ...st, dl: undefined } : { ...st, dl: { loaded: p.loaded, total: p.total } };
-        return { ...st, where: p.where };
+        if (p.phase === "download") {
+          if (st.s !== "working" && !(st.s === "done" && st.res.preview)) return st;
+          const dl = { ...st.dl, [p.model]: p.loaded >= p.total ? undefined : { loaded: p.loaded, total: p.total } };
+          return { ...st, dl };
+        }
+        return st.s === "working" ? { ...st, where: p.where } : st;
       });
     });
   }, []);
@@ -132,12 +137,7 @@ export default function Tool() {
     const src = keepUrl(URL.createObjectURL(file));
     setPos(1);
     setState({ s: "working", src, name, file });
-    try {
-      const res = await removeBackground(file);
-      if (id !== run.current) return;
-      const out = keepUrl(URL.createObjectURL(res.png));
-      setState({ s: "done", src, name, file, out, res });
-      // Reveal: wipe the result in from left to right.
+    const reveal = () => {
       const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
       if (reduce) return setPos(1);
       setPos(0);
@@ -148,6 +148,23 @@ export default function Tool() {
         if (k < 1 && id === run.current) requestAnimationFrame(step);
       };
       requestAnimationFrame(step);
+    };
+    let shown = false;
+    try {
+      const res = await removeBackground(file, (preview) => {
+        if (id !== run.current) return preview.bitmap.close();
+        const out = keepUrl(URL.createObjectURL(preview.png));
+        setState((st) => ({ s: "done", src, name, file, out, res: preview, dl: st.s === "working" ? st.dl : undefined }));
+        shown = true;
+        reveal();
+      });
+      if (id !== run.current) return;
+      const out = keepUrl(URL.createObjectURL(res.png));
+      setState((st) => {
+        if (st.s === "done" && st.res.preview) st.res.bitmap.close();
+        return { s: "done", src, name, file, out, res };
+      });
+      if (!shown) reveal();
     } catch (e) {
       if (id !== run.current) return;
       setState({ s: "error", src, name, file, message: (e as Error).message || "Something went wrong." });
@@ -326,7 +343,7 @@ export default function Tool() {
               <img src={state.s !== "idle" ? state.src : undefined} alt="Original" className="block max-h-[68vh] w-auto max-w-full" draggable={false} />
 
               {state.s === "working" && (
-                <div className={`absolute inset-0 ${state.dl ? "shimmer bg-ink/20" : "sweep"}`} aria-hidden />
+                <div className={`absolute inset-0 ${state.dl?.quick || state.dl?.full ? "shimmer bg-ink/20" : "sweep"}`} aria-hidden />
               )}
 
               {state.s === "done" && (
@@ -358,14 +375,17 @@ export default function Tool() {
 
             {state.s === "working" && (
               <div className="mx-auto mt-4 max-w-md text-center text-sm" aria-live="polite">
-                {state.dl ? (
+                {state.dl?.quick ? (
+                  <>
+                    <p className="font-medium">Loading the quick preview…</p>
+                    <Bar dl={state.dl.quick} />
+                  </>
+                ) : state.dl?.full ? (
                   <>
                     <p className="font-medium">Warming up the AI engine (one-time setup)…</p>
-                    <div className="mt-2 h-2 overflow-hidden rounded-full bg-line">
-                      <div className="h-full rounded-full bg-accent transition-[width] duration-150" style={{ width: `${(state.dl.loaded / state.dl.total) * 100}%` }} />
-                    </div>
+                    <Bar dl={state.dl.full} />
                     <p className="mt-1.5 text-xs text-muted">
-                      {fmtMB(state.dl.loaded)} of {fmtMB(state.dl.total)}. After this, cutouts take about a second.
+                      {fmtMB(state.dl.full.loaded)} of {fmtMB(state.dl.full.total)}. After this, cutouts take about a second.
                     </p>
                   </>
                 ) : (
@@ -393,7 +413,28 @@ export default function Tool() {
               </div>
             )}
 
-            {state.s === "done" && (
+            {state.s === "done" && state.res.preview && (
+              <div className="pop-in" aria-live="polite">
+                <p className="font-display text-2xl font-extrabold">Quick preview</p>
+                <p className="mt-1 text-sm text-muted">
+                  Ready in {fmtTime(state.res.ms)} on your device. Sharpening it with the full model (one-time download)…
+                </p>
+                {state.dl?.full ? (
+                  <>
+                    <Bar dl={state.dl.full} />
+                    <p className="mt-1.5 text-xs text-muted">
+                      {fmtMB(state.dl.full.loaded)} of {fmtMB(state.dl.full.total)}
+                    </p>
+                  </>
+                ) : (
+                  <div className="mt-2 h-2 overflow-hidden rounded-full bg-line">
+                    <div className="sweep h-full w-full rounded-full" />
+                  </div>
+                )}
+              </div>
+            )}
+
+            {state.s === "done" && !state.res.preview && (
               <div className="pop-in">
                 <p className="font-display text-2xl font-extrabold">Clean cut in {fmtTime(state.res.ms)}</p>
                 <p className="mt-1 flex items-center gap-1.5 text-sm text-muted">
@@ -477,6 +518,14 @@ export default function Tool() {
           </aside>
         </section>
       )}
+    </div>
+  );
+}
+
+function Bar({ dl }: { dl: Dl }) {
+  return (
+    <div className="mt-2 h-2 overflow-hidden rounded-full bg-line">
+      <div className="h-full rounded-full bg-accent transition-[width] duration-150" style={{ width: `${(dl.loaded / dl.total) * 100}%` }} />
     </div>
   );
 }

@@ -1,38 +1,38 @@
 /// <reference lib="webworker" />
-// Runs ISNet-general (fp16 weights) on WebGPU inside a dedicated worker so the page never janks.
-// Same model and preprocessing as the server, so device and server cutouts match.
-// Messages in:  {type:"preload"} | {type:"cutout", id, bitmap}
-// Messages out: {type:"progress", loaded, total} | {type:"ready"} | {type:"result", id, png, bitmap, ms}
-//               {type:"error", id?, message}
+// Runs the cutout models on WebGPU inside a dedicated worker so the page never janks.
+//   full:  ISNet-general (fp16 weights, 90 MB). Same model and preprocessing as the server,
+//          so device and server cutouts match.
+//   quick: MODNet portrait matting (fp16, 13 MB, CPU/wasm). Only used for a fast preview on
+//          the first visit while ISNet is still downloading.
+// Messages in:  {type:"preload", model} | {type:"cutout", id, model, bitmap}
+// Messages out: {type:"progress", model, loaded, total, cached?} | {type:"ready", model}
+//               {type:"result", id, png, bitmap, ms} | {type:"error", id?, model?, message}
 import * as ort from "onnxruntime-web/webgpu";
 import { foregroundEstimate } from "./foreground";
+import { MODEL_CACHE as CACHE, MODELS, type Model } from "./models";
 
 declare const self: DedicatedWorkerGlobalScope;
 
-const MODEL_URL =
-  process.env.NEXT_PUBLIC_MODEL_URL ||
-  `${(process.env.NEXT_PUBLIC_API_URL || "https://api.nobg.here").replace(/\/$/, "")}/models/isnet-fp16-281bde9e.bin`;
-const MODEL_BYTES = 90_447_799;
-const CACHE = "nobg-models-v2";
-const SIZE = 1024;
+const ISNET_SIZE = 1024;
 const MAX_PIXELS = 16_000_000;
 
 ort.env.wasm.wasmPaths = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ort.env.versions.web}/dist/`;
 ort.env.logLevel = "error";
 
-let session: Promise<ort.InferenceSession> | null = null;
+const sessions: Partial<Record<Model, Promise<ort.InferenceSession>>> = {};
 
-async function fetchModel(): Promise<ArrayBuffer> {
+async function fetchModel(model: Model): Promise<ArrayBuffer> {
+  const { url, bytes } = MODELS[model];
   const cache = await caches.open(CACHE).catch(() => null);
-  const hit = await cache?.match(MODEL_URL);
+  const hit = await cache?.match(url);
   if (hit) {
     const buf = await hit.arrayBuffer();
-    self.postMessage({ type: "progress", loaded: buf.byteLength, total: buf.byteLength, cached: true });
+    self.postMessage({ type: "progress", model, loaded: buf.byteLength, total: buf.byteLength, cached: true });
     return buf;
   }
-  const res = await fetch(MODEL_URL);
+  const res = await fetch(url);
   if (!res.ok || !res.body) throw new Error(`Model download failed (${res.status})`);
-  const total = Number(res.headers.get("content-length")) || MODEL_BYTES;
+  const total = Number(res.headers.get("content-length")) || bytes;
   const reader = res.body.getReader();
   const chunks: Uint8Array[] = [];
   let loaded = 0;
@@ -45,7 +45,7 @@ async function fetchModel(): Promise<ArrayBuffer> {
     const now = performance.now();
     if (now - last > 80) {
       last = now;
-      self.postMessage({ type: "progress", loaded, total });
+      self.postMessage({ type: "progress", model, loaded, total });
     }
   }
   const buf = new Uint8Array(loaded);
@@ -54,31 +54,37 @@ async function fetchModel(): Promise<ArrayBuffer> {
     buf.set(c, off);
     off += c.byteLength;
   }
-  self.postMessage({ type: "progress", loaded, total: loaded });
-  cache?.put(MODEL_URL, new Response(buf.slice().buffer, { headers: { "content-type": "application/octet-stream" } })).catch(() => {});
+  self.postMessage({ type: "progress", model, loaded, total: loaded });
+  cache?.put(url, new Response(buf.slice().buffer, { headers: { "content-type": "application/octet-stream" } })).catch(() => {});
   return buf.buffer;
 }
 
-function getSession() {
-  if (!session) {
-    session = (async () => {
-      const model = await fetchModel();
-      const s = await ort.InferenceSession.create(model, {
-        executionProviders: ["webgpu"],
+function getSession(model: Model) {
+  let s = sessions[model];
+  if (!s) {
+    s = (async () => {
+      // Don't let the 90 MB download compete for bandwidth with the quick preview model.
+      if (model === "full" && sessions.quick) await sessions.quick.catch(() => {});
+      const buf = await fetchModel(model);
+      // MODNet runs on the CPU (wasm): ORT Web's WebGPU kernels give a wrong matte for it in both
+      // fp16 and fp32 (checked against onnxruntime CPU), while wasm matches and takes about 1 s.
+      const sess = await ort.InferenceSession.create(buf, {
+        executionProviders: [model === "full" ? "webgpu" : "wasm"],
         graphOptimizationLevel: "all",
       });
-      // Warm-up compiles the WebGPU shaders so the first real image is fast.
-      const warm = new ort.Tensor("float32", new Float32Array(3 * SIZE * SIZE), [1, 3, SIZE, SIZE]);
-      const out = await s.run({ [s.inputNames[0]]: warm });
-      Object.values(out).forEach((t) => t.dispose?.());
-      self.postMessage({ type: "ready" });
-      return s;
+      if (model === "full") {
+        // Warm-up compiles the WebGPU shaders so the first real image is fast.
+        const t = new ort.Tensor("float32", new Float32Array(3 * ISNET_SIZE * ISNET_SIZE), [1, 3, ISNET_SIZE, ISNET_SIZE]);
+        const out = await sess.run({ [sess.inputNames[0]]: t });
+        Object.values(out).forEach((v) => v.dispose?.());
+      }
+      self.postMessage({ type: "ready", model });
+      return sess;
     })();
-    session.catch(() => {
-      session = null;
-    });
+    sessions[model] = s;
+    s.catch(() => delete sessions[model]);
   }
-  return session;
+  return s;
 }
 
 function fit(w: number, h: number) {
@@ -87,9 +93,15 @@ function fit(w: number, h: number) {
   return [Math.max(1, Math.round(w * s)), Math.max(1, Math.round(h * s))];
 }
 
-async function cutout(src: ImageBitmap) {
-  const t0 = performance.now();
-  const s = await getSession();
+/** MODNet input size: shortest edge 512, longest capped at 1024, both multiples of 32. */
+function modnetSize(w: number, h: number) {
+  const s = Math.min(512 / Math.min(w, h), 1024 / Math.max(w, h));
+  const r = (v: number) => Math.max(32, Math.round((v * s) / 32) * 32);
+  return [r(w), r(h)];
+}
+
+async function cutout(src: ImageBitmap, model: Model) {
+  const s = await getSession(model);
   const t1 = performance.now();
   const [W, H] = fit(src.width, src.height);
 
@@ -99,36 +111,48 @@ async function cutout(src: ImageBitmap) {
   fctx.drawImage(src, 0, 0, W, H);
   const img = fctx.getImageData(0, 0, W, H);
 
-  // Model input: 1024x1024 CHW, ISNet normalisation (x / max - 0.5).
-  const small = new OffscreenCanvas(SIZE, SIZE);
+  const [mw, mh] = model === "full" ? [ISNET_SIZE, ISNET_SIZE] : modnetSize(W, H);
+  const small = new OffscreenCanvas(mw, mh);
   const sctx = small.getContext("2d", { willReadFrequently: true })!;
   sctx.imageSmoothingQuality = "high";
-  sctx.drawImage(src, 0, 0, SIZE, SIZE);
-  const px = sctx.getImageData(0, 0, SIZE, SIZE).data;
-  const n = SIZE * SIZE;
-  let max = 1;
-  for (let i = 0; i < n * 4; i++) if ((i & 3) !== 3 && px[i] > max) max = px[i];
+  sctx.drawImage(src, 0, 0, mw, mh);
+  const px = sctx.getImageData(0, 0, mw, mh).data;
+  const n = mw * mh;
   const input = new Float32Array(3 * n);
-  for (let i = 0; i < n; i++) {
-    input[i] = px[i * 4] / max - 0.5;
-    input[n + i] = px[i * 4 + 1] / max - 0.5;
-    input[2 * n + i] = px[i * 4 + 2] / max - 0.5;
+  if (model === "full") {
+    // ISNet normalisation: x / max - 0.5
+    let max = 1;
+    for (let i = 0; i < n * 4; i++) if ((i & 3) !== 3 && px[i] > max) max = px[i];
+    for (let i = 0; i < n; i++) {
+      input[i] = px[i * 4] / max - 0.5;
+      input[n + i] = px[i * 4 + 1] / max - 0.5;
+      input[2 * n + i] = px[i * 4 + 2] / max - 0.5;
+    }
+  } else {
+    // MODNet normalisation: (x / 255 - 0.5) / 0.5
+    for (let i = 0; i < n; i++) {
+      input[i] = px[i * 4] / 127.5 - 1;
+      input[n + i] = px[i * 4 + 1] / 127.5 - 1;
+      input[2 * n + i] = px[i * 4 + 2] / 127.5 - 1;
+    }
   }
-  const feeds = { [s.inputNames[0]]: new ort.Tensor("float32", input, [1, 3, SIZE, SIZE]) };
-  const out = await s.run(feeds);
-  const logits = out[s.outputNames[0]];
-  const data = (await logits.getData()) as Float32Array;
+  const out = await s.run({ [s.inputNames[0]]: new ort.Tensor("float32", input, [1, 3, mh, mw]) });
+  const data = (await out[s.outputNames[0]].getData()) as Float32Array;
   Object.values(out).forEach((t) => t.dispose?.());
 
-  // Min-max normalise -> 8-bit mask, then bilinear upscale to full res via canvas.
-  let lo = Infinity;
-  let hi = -Infinity;
-  for (let i = 0; i < n; i++) {
-    if (data[i] < lo) lo = data[i];
-    if (data[i] > hi) hi = data[i];
+  // ISNet: min-max normalise. MODNet already outputs a 0..1 matte.
+  let lo = 0;
+  let span = 1;
+  if (model === "full") {
+    lo = Infinity;
+    let hi = -Infinity;
+    for (let i = 0; i < n; i++) {
+      if (data[i] < lo) lo = data[i];
+      if (data[i] > hi) hi = data[i];
+    }
+    span = Math.max(hi - lo, 1e-6);
   }
-  const span = Math.max(hi - lo, 1e-6);
-  const mask = new ImageData(SIZE, SIZE);
+  const mask = new ImageData(mw, mh);
   for (let i = 0; i < n; i++) {
     const a = ((data[i] - lo) / span) * 255;
     const j = i * 4;
@@ -136,7 +160,6 @@ async function cutout(src: ImageBitmap) {
     mask.data[j + 3] = 255;
   }
   sctx.putImageData(mask, 0, 0);
-  const t2 = performance.now();
   const up = new OffscreenCanvas(W, H);
   const uctx = up.getContext("2d", { willReadFrequently: true })!;
   uctx.imageSmoothingQuality = "high";
@@ -148,16 +171,16 @@ async function cutout(src: ImageBitmap) {
   fctx.putImageData(rgba, 0, 0);
   const png = await full.convertToBlob({ type: "image/png" });
   const bitmap = full.transferToImageBitmap();
-  return { png, bitmap, ms: Math.round(performance.now() - t1), inferMs: Math.round(t2 - t1), waitMs: Math.round(t1 - t0) };
+  return { png, bitmap, ms: Math.round(performance.now() - t1) };
 }
 
 self.onmessage = async (e: MessageEvent) => {
   const msg = e.data;
   if (msg.type === "preload") {
-    getSession().catch((err) => self.postMessage({ type: "error", message: String(err?.message || err) }));
+    getSession(msg.model).catch((err) => self.postMessage({ type: "error", model: msg.model, message: String(err?.message || err) }));
   } else if (msg.type === "cutout") {
     try {
-      const r = await cutout(msg.bitmap);
+      const r = await cutout(msg.bitmap, msg.model);
       msg.bitmap.close();
       self.postMessage({ type: "result", id: msg.id, ...r }, [r.bitmap]);
     } catch (err) {

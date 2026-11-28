@@ -1,16 +1,21 @@
 "use client";
 // Chooses where a cutout runs: on-device (WebGPU worker) when possible, otherwise the
 // nobg server via Cloudflare Tunnel. Uploads go straight to the API, never through Vercel.
+// On a first visit the 90 MB ISNet model isn't cached yet, so a 13 MB MODNet preview is shown
+// within about a second, then replaced by the full cutout once ISNet has downloaded.
+import { isCached, type Model } from "./models";
 
 export const API_URL = (process.env.NEXT_PUBLIC_API_URL || "https://api.nobg.here").replace(/\/$/, "");
 
 export type Where = "device" | "server";
-export type CutoutResult = { png: Blob; bitmap: ImageBitmap; ms: number; where: Where; width: number; height: number };
-export type Progress = { phase: "download"; loaded: number; total: number; cached?: boolean } | { phase: "processing"; where: Where };
+export type CutoutResult = { png: Blob; bitmap: ImageBitmap; ms: number; where: Where; width: number; height: number; preview?: boolean };
+export type Progress =
+  | { phase: "download"; model: Model; loaded: number; total: number; cached?: boolean }
+  | { phase: "processing"; where: Where };
 
 let worker: Worker | null = null;
 let gpuOk: Promise<boolean> | null = null;
-let modelReady = false;
+const ready = new Set<Model>();
 const listeners = new Set<(p: Progress) => void>();
 const pending = new Map<number, { resolve: (v: Omit<CutoutResult, "where" | "width" | "height">) => void; reject: (e: Error) => void }>();
 let nextId = 1;
@@ -21,8 +26,13 @@ export function onProgress(fn: (p: Progress) => void) {
 }
 const emit = (p: Progress) => listeners.forEach((fn) => fn(p));
 
-export function isModelReady() {
-  return modelReady;
+export function isModelReady(model: Model = "full") {
+  return ready.has(model);
+}
+
+/** True when the full model still has to be downloaded, so a quick preview is worth it. */
+async function needsPreview() {
+  return !ready.has("full") && !(await isCached("full"));
 }
 
 export function hasWebGPU(): Promise<boolean> {
@@ -46,8 +56,8 @@ function getWorker() {
   worker = new Worker(new URL("./cutout.worker.ts", import.meta.url), { type: "module" });
   worker.onmessage = (e) => {
     const m = e.data;
-    if (m.type === "progress") emit({ phase: "download", loaded: m.loaded, total: m.total, cached: m.cached });
-    else if (m.type === "ready") modelReady = true;
+    if (m.type === "progress") emit({ phase: "download", model: m.model, loaded: m.loaded, total: m.total, cached: m.cached });
+    else if (m.type === "ready") ready.add(m.model);
     else if (m.type === "result") {
       pending.get(m.id)?.resolve({ png: m.png, bitmap: m.bitmap, ms: m.ms });
       pending.delete(m.id);
@@ -55,7 +65,7 @@ function getWorker() {
       if (m.id) {
         pending.get(m.id)?.reject(new Error(m.message));
         pending.delete(m.id);
-      } else console.warn("[nobg] preload failed:", m.message);
+      } else console.warn(`[nobg] ${m.model} model failed to load:`, m.message);
     }
   };
   worker.onerror = (e) => {
@@ -68,18 +78,23 @@ function getWorker() {
 }
 
 /** Start fetching the on-device model early (hover / focus / sample click). */
+let preloaded = false;
 export async function preload() {
-  if (await hasWebGPU()) getWorker().postMessage({ type: "preload" });
+  if (preloaded || !(await hasWebGPU())) return;
+  preloaded = true;
+  const w = getWorker();
+  if (await needsPreview()) w.postMessage({ type: "preload", model: "quick" }); // small one first
+  w.postMessage({ type: "preload", model: "full" });
 }
 
-async function onDevice(file: Blob): Promise<CutoutResult> {
+async function onDevice(file: Blob, model: Model = "full"): Promise<CutoutResult> {
   const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
   const { width, height } = bitmap;
   const id = nextId++;
   const w = getWorker();
   const r = await new Promise<Omit<CutoutResult, "where" | "width" | "height">>((resolve, reject) => {
     pending.set(id, { resolve, reject });
-    w.postMessage({ type: "cutout", id, bitmap }, [bitmap]);
+    w.postMessage({ type: "cutout", id, model, bitmap }, [bitmap]);
   });
   return { ...r, where: "device", width: r.bitmap.width || width, height: r.bitmap.height || height };
 }
@@ -112,10 +127,26 @@ async function onServer(file: Blob): Promise<CutoutResult> {
   return { png, bitmap, ms: Math.round(performance.now() - t0), where: "server", width: bitmap.width, height: bitmap.height };
 }
 
-export async function removeBackground(file: Blob, prefer: "auto" | "server" = "auto"): Promise<CutoutResult> {
-  if (prefer === "auto" && (await hasWebGPU())) {
+/**
+ * onPreview, if given, may be called once with a quick MODNet cutout before the final result,
+ * when the full model isn't downloaded yet. The final (ISNet) result is what this resolves to.
+ */
+export async function removeBackground(file: Blob, onPreview?: (r: CutoutResult) => void): Promise<CutoutResult> {
+  if (await hasWebGPU()) {
     try {
       emit({ phase: "processing", where: "device" });
+      if (onPreview && (await needsPreview())) {
+        preload();
+        let done = false;
+        onDevice(file, "quick")
+          .then((r) => (done ? r.bitmap.close() : onPreview({ ...r, preview: true })))
+          .catch((e) => console.warn("[nobg] quick preview failed:", e));
+        try {
+          return await onDevice(file);
+        } finally {
+          done = true;
+        }
+      }
       return await onDevice(file);
     } catch (e) {
       console.warn("[nobg] on-device cutout failed, using server:", e);

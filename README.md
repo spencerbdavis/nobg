@@ -9,7 +9,8 @@ watermark, no upload (with WebGPU), and full resolution.
 - **Private by default.** With WebGPU (Chrome, Edge, Safari 26+), the AI model runs in your browser and your photo never
   leaves your machine. Older devices fall back to a server that processes in memory and keeps nothing.
 - **Fast.** About 0.5 s for a typical photo and 1.3 s for a 12 MP phone shot on an M-series Mac after a one-time 90 MB
-  model download.
+  model download. On a first visit, a 13 MB portrait model shows a quick preview while the full model downloads, then
+  the full cutout replaces it automatically.
 - **Clean edges.** A matting model plus colour decontamination, so hair and fur don't get a halo.
 - **Quick polish.** Before/after slider, and backgrounds that are transparent, solid, a custom colour, or a blur of the
   original. Download a PNG or a composite.
@@ -28,6 +29,7 @@ browser ──(WebGPU)──> cutout on device             model: /models/*.bin 
 | Web (`web/`) | Next.js and Tailwind on Vercel. The model runs in a Web Worker via ONNX Runtime Web (WebGPU). |
 | Inference (`server/`) | FastAPI, ONNX Runtime (CPU), Redis rate limits and job queue, Postgres for keys and usage. Docker Compose on a small home server, reachable only through a Cloudflare Tunnel. |
 | Model | [ISNet / DIS](https://github.com/xuebinqin/DIS) general-use (Apache-2.0). The browser gets an fp16 build (`tools/make_web_model.py`, reproducible and checksum-verified). |
+| Preview model | [MODNet](https://github.com/ZHKKKe/MODNet) portrait matting (Apache-2.0), fp16, 13 MB. Only for the first-visit preview. It runs on the CPU (wasm) because ONNX Runtime Web's WebGPU kernels produce a wrong matte for it. |
 
 The cutout pipeline is identical on device and server, and their outputs differ by less than 1/255 in alpha on average:
 
@@ -83,8 +85,8 @@ overlap for a zero-downtime cutover.
 cd web && pnpm install && pnpm dev
 ```
 
-Env: `NEXT_PUBLIC_API_URL` (default `https://api.nobg.here`) and `NEXT_PUBLIC_MODEL_URL` (default
-`<api>/models/isnet-fp16-281bde9e.bin`). Add `?server` to the URL to force the server path.
+Env: `NEXT_PUBLIC_API_URL` (default `https://api.nobg.here`), `NEXT_PUBLIC_MODEL_URL` (default
+`<api>/models/isnet-fp16-281bde9e.bin`) and `NEXT_PUBLIC_QUICK_MODEL_URL` (default `<api>/models/modnet-fp16-25f165da.bin`). Add `?server` to the URL to force the server path.
 
 ## API
 
@@ -95,5 +97,6 @@ Full docs: [nobg.here/developers](https://nobg.here/developers).
 
 ## Credits
 
-Model: ISNet / DIS by Xuebin Qin et al. (Apache-2.0), via the [rembg](https://github.com/danielgatis/rembg) ONNX export.
+Models: ISNet / DIS by Xuebin Qin et al. (Apache-2.0), via the [rembg](https://github.com/danielgatis/rembg) ONNX export.
+MODNet by Zhanghan Ke et al. (Apache-2.0), via the [Xenova/modnet](https://huggingface.co/Xenova/modnet) ONNX export.
 Sample photos: [Unsplash](https://unsplash.com).
